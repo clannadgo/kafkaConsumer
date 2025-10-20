@@ -1,18 +1,21 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/IBM/sarama"
 )
+
+const ConsumerId = "kafka-consumer-tools"
 
 // MessageRecord 用于输出 JSON 文件
 type MessageRecord struct {
@@ -34,10 +37,64 @@ func cleanString(s string) string {
 	}, s)
 }
 
+// ConsumerGroupHandler 实现 sarama.ConsumerGroupHandler
+type ConsumerGroupHandler struct {
+	filter  string
+	jsonOut string
+	file    *os.File
+}
+
+func (h *ConsumerGroupHandler) Setup(sarama.ConsumerGroupSession) error   { return nil }
+func (h *ConsumerGroupHandler) Cleanup(sarama.ConsumerGroupSession) error { return nil }
+
+func (h *ConsumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	for msg := range claim.Messages() {
+		if msg == nil {
+			continue
+		}
+		val := cleanString(string(msg.Value))
+		if h.filter != "" && !strings.Contains(val, h.filter) {
+			continue
+		}
+
+		var rec MessageRecord
+		var parsed interface{}
+		if err := json.Unmarshal([]byte(val), &parsed); err == nil {
+			rec = MessageRecord{
+				Partition: msg.Partition,
+				Offset:    msg.Offset,
+				Key:       string(msg.Key),
+				Value:     parsed,
+			}
+		} else {
+			rec = MessageRecord{
+				Partition: msg.Partition,
+				Offset:    msg.Offset,
+				Key:       string(msg.Key),
+				Value:     val,
+			}
+		}
+
+		if h.file != nil {
+			data, _ := json.MarshalIndent(rec, "", "  ")
+			h.file.Write(data)
+			h.file.Write([]byte("\n"))
+
+			count := atomic.AddUint64(&msgCount, 1)
+			fmt.Printf("已写入第 %d 条消息\n", count)
+		} else {
+			fmt.Printf("分区:%d offset:%d key:%s value:%v\n",
+				msg.Partition, msg.Offset, string(msg.Key), rec.Value)
+		}
+
+		session.MarkMessage(msg, "")
+	}
+	return nil
+}
+
 func main() {
 	// 命令行参数
-	ip := flag.String("ip", "127.0.0.1", "Kafka broker IP 地址")
-	port := flag.String("port", "9092", "Kafka broker 端口")
+	broker := flag.String("broker", "127.0.0.1:9092", "Kafka broker 地址，支持多个以逗号分隔 (例如: broker1:9092,broker2:9092)")
 	topic := flag.String("topic", "", "Kafka 主题 (必填)")
 	filter := flag.String("filter", "", "消息过滤关键字 (可选，类似 grep)")
 	username := flag.String("user", "", "用户名 (可选)")
@@ -45,18 +102,6 @@ func main() {
 	offsetOldest := flag.Bool("from-beginning", false, "是否从头开始消费 (默认最新)")
 	jsonOut := flag.String("json-out", "", "将消息以 JSON 格式写入文件 (可选，带缩进)")
 
-	// 自定义 Usage
-	flag.Usage = func() {
-		_, _ = fmt.Fprintf(os.Stderr, "用法: %s [参数]\n\n参数说明:\n", os.Args[0])
-		_, _ = fmt.Fprintf(os.Stderr, "  -ip string\n\tKafka broker IP 地址 (默认 \"127.0.0.1\")\n")
-		_, _ = fmt.Fprintf(os.Stderr, "  -port string\n\tKafka broker 端口 (默认 \"9092\")\n")
-		_, _ = fmt.Fprintf(os.Stderr, "  -topic string\n\tKafka 主题 (必填)\n")
-		_, _ = fmt.Fprintf(os.Stderr, "  -filter string\n\t消息过滤关键字 (可选，类似 grep)\n")
-		_, _ = fmt.Fprintf(os.Stderr, "  -user string\n\t用户名 (可选)\n")
-		_, _ = fmt.Fprintf(os.Stderr, "  -pass string\n\t密码 (可选)\n")
-		_, _ = fmt.Fprintf(os.Stderr, "  -from-beginning\n\t是否从头开始消费 (默认最新)\n")
-		_, _ = fmt.Fprintf(os.Stderr, "  -json-out string\n\t将消息以 JSON 格式写入文件 (可选，带缩进)\n")
-	}
 	flag.Parse()
 
 	if *topic == "" {
@@ -65,12 +110,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	broker := fmt.Sprintf("%s:%s", *ip, *port)
+	brokers := strings.Split(*broker, ",")
+	for i := range brokers {
+		brokers[i] = strings.TrimSpace(brokers[i]) // 去除可能的空格
+	}
 
 	// Kafka 配置
 	config := sarama.NewConfig()
-	config.Consumer.Return.Errors = true
 	config.Version = sarama.MaxVersion
+	config.Consumer.Return.Errors = true
+	config.Consumer.Offsets.Initial = sarama.OffsetNewest
+	if *offsetOldest {
+		config.Consumer.Offsets.Initial = sarama.OffsetOldest
+	}
 
 	if *username != "" && *password != "" {
 		config.Net.SASL.Enable = true
@@ -91,99 +143,67 @@ func main() {
 		defer file.Close()
 		fmt.Printf("消息将以 JSON 格式写入文件: %s\n", *jsonOut)
 	}
-
-	// 创建 Kafka 消费者
-	consumer, err := sarama.NewConsumer([]string{broker}, config)
+	consumerId := ConsumerId + time.Now().Format("20060102150405")
+	group, err := sarama.NewConsumerGroup(brokers, consumerId, config)
+	go func() {
+		for err := range group.Errors() {
+			fmt.Println("Kafka 错误:", err)
+		}
+	}()
 	if err != nil {
-		fmt.Println("创建消费者失败:", err)
+		fmt.Println("创建 ConsumerGroup 失败:", err)
 		os.Exit(1)
 	}
-	defer consumer.Close()
+	defer group.Close()
 
-	partitions, err := consumer.Partitions(*topic)
-	if err != nil {
-		fmt.Println("获取分区失败:", err)
-		os.Exit(1)
+	handler := &ConsumerGroupHandler{
+		filter:  *filter,
+		jsonOut: *jsonOut,
+		file:    file,
 	}
 
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
-	done := make(chan struct{})
 
-	var wg sync.WaitGroup
-	offset := sarama.OffsetNewest
-	if *offsetOldest {
-		offset = sarama.OffsetOldest
-	}
+	topics := []string{*topic}
+	ctx, cancel := context.WithCancel(context.Background())
 
-	for _, partition := range partitions {
-		pc, err := consumer.ConsumePartition(*topic, partition, offset)
-		if err != nil {
-			fmt.Printf("订阅分区 %d 失败: %v\n", partition, err)
-			continue
-		}
+	go func() {
+		for {
+			// 如果 context 已取消，退出循环
+			if ctx.Err() != nil {
+				group.Close()
+				return
+			}
 
-		wg.Add(1)
-		go func(pc sarama.PartitionConsumer) {
-			defer pc.Close()
-			defer wg.Done()
-			for {
-				select {
-				case msg := <-pc.Messages():
-					if msg == nil {
-						continue
-					}
-					val := cleanString(string(msg.Value))
-					if *filter != "" && !strings.Contains(val, *filter) {
-						continue
-					}
-
-					var rec MessageRecord
-
-					// 尝试解析 value 为 JSON
-					var parsed interface{}
-					if err := json.Unmarshal([]byte(val), &parsed); err == nil {
-						rec = MessageRecord{
-							Partition: msg.Partition,
-							Offset:    msg.Offset,
-							Key:       string(msg.Key),
-							Value:     parsed,
-						}
-					} else {
-						rec = MessageRecord{
-							Partition: msg.Partition,
-							Offset:    msg.Offset,
-							Key:       string(msg.Key),
-							Value:     val,
-						}
-					}
-
-					if *jsonOut != "" {
-						data, _ := json.MarshalIndent(rec, "", "  ")
-						file.Write(data)
-						file.Write([]byte("\n"))
-
-						count := atomic.AddUint64(&msgCount, 1)
-						fmt.Printf("已写入第 %d 条消息\n", count)
-					} else {
-						fmt.Printf("分区:%d offset:%d key:%s value:%v\n",
-							msg.Partition, msg.Offset, string(msg.Key), rec.Value)
-					}
-
-				case err := <-pc.Errors():
-					if err != nil {
-						fmt.Println("消费错误:", err)
-					}
-				case <-done:
+			err := group.Consume(ctx, topics, handler)
+			if err != nil {
+				fmt.Println("消费错误:", err)
+				// 如果 group 已关闭，也退出
+				if strings.Contains(err.Error(), "closed") {
 					return
 				}
 			}
-		}(pc)
-	}
+		}
+	}()
 
 	<-signals
+	cancel() // ✅ 通知 goroutine 停止消费
 	fmt.Println("收到退出信号，正在关闭...")
-	close(done)
-	wg.Wait()
+	time.Sleep(time.Second * 3)
+	// ✅ 删除当前 Consumer Group
+	admin, err := sarama.NewClusterAdmin(brokers, config)
+	if err != nil {
+		fmt.Println("创建 Admin 客户端失败:", err)
+	} else {
+		err = admin.DeleteConsumerGroup(consumerId)
+		if err != nil {
+			fmt.Printf("删除消费者组 %s 失败: %v\n", consumerId, err)
+		} else {
+			fmt.Printf("已成功删除消费者组: %s\n", consumerId)
+		}
+		admin.Close()
+	}
+
 	fmt.Println("退出完成，总共写入消息:", msgCount)
 }
